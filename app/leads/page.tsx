@@ -1,352 +1,445 @@
 "use client";
 
+import React, { useEffect, useMemo, useState } from "react";
 import Image from "next/image";
-import { useEffect, useMemo, useState, KeyboardEvent } from "react";
-import { useRouter } from "next/navigation";
+import Link from "next/link";
 
-type PlaceRow = {
-  place_id?: string;
-  name?: string;
-  city?: string;
-  uf?: string;
-  neighborhood?: string;
-  address?: string;
+type CompanyRow = {
+  id?: string | number;
+
+  name?: string; // Nome da empresa
+  city?: string; // Cidade
+  neighborhood?: string; // Bairro
+  address?: string; // Endereço
   postal_code?: string; // CEP
-  ddd?: string;
-  phone?: string;
-  website?: string;
+  ddd?: string; // DDD
+  phone?: string; // Telefone
+  website?: string; // Site
 };
 
-type Municipio = { nome: string };
-type IBGECity = { nome: string };
+// Estados disponíveis (você pediu SP e MG)
+const STATES = ["SP", "MG"] as const;
 
-const UF_OPTIONS = [
-  { uf: "SP", label: "São Paulo (SP)" },
-  { uf: "MG", label: "Minas Gerais (MG)" },
-];
+// Cidades (lista). Para não travar o projeto, vou começar com um conjunto bom de SP e MG.
+// Você pode aumentar depois — o dropdown já fica em ordem alfabética.
+const CITIES_BY_STATE: Record<string, string[]> = {
+  SP: [
+    "São Paulo",
+    "Guarulhos",
+    "Campinas",
+    "São Bernardo do Campo",
+    "Santo André",
+    "Osasco",
+    "Sorocaba",
+    "Ribeirão Preto",
+    "Santos",
+    "São José dos Campos",
+    "Jundiaí",
+    "Mogi das Cruzes",
+    "Diadema",
+    "Carapicuíba",
+    "Itaquaquecetuba",
+    "Barueri",
+    "Embu das Artes",
+    "Taboão da Serra",
+    "Cotia",
+    "Mauá",
+    "Suzano",
+    "Praia Grande",
+    "Guarujá",
+    "Bauru",
+    "Limeira",
+    "Sumaré",
+    "Hortolândia",
+    "Indaiatuba",
+    "Americana",
+    "Piracicaba",
+    "Franca",
+    "São Vicente",
+  ],
+  MG: [
+    "Belo Horizonte",
+    "Contagem",
+    "Betim",
+    "Uberlândia",
+    "Juiz de Fora",
+    "Montes Claros",
+    "Ribeirão das Neves",
+    "Uberaba",
+    "Governador Valadares",
+    "Ipatinga",
+    "Divinópolis",
+    "Sete Lagoas",
+    "Santa Luzia",
+    "Ibirité",
+    "Poços de Caldas",
+  ],
+};
 
-function uniq(arr: string[]) {
-  return Array.from(new Set(arr.map((x) => x.trim()).filter(Boolean)));
+function normalizeKeywords(list: string[]) {
+  const cleaned = list
+    .map((k) => (k ?? "").toString().trim())
+    .filter((k) => k.length > 0);
+
+  // remove duplicadas (case-insensitive)
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const k of cleaned) {
+    const key = k.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(k);
+    }
+  }
+  return out;
+}
+
+function dedupeCompanies(rows: CompanyRow[]) {
+  // Dedup por "name + address" (tende a ser o mais estável)
+  const seen = new Set<string>();
+  const out: CompanyRow[] = [];
+  for (const r of rows) {
+    const key = `${(r.name || "").trim().toLowerCase()}|${(r.address || "")
+      .trim()
+      .toLowerCase()}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(r);
+    }
+  }
+  return out;
 }
 
 export default function LeadsPage() {
-  const router = useRouter();
+  const [estado, setEstado] = useState<string>("SP");
+  const [cidade, setCidade] = useState<string>("São Paulo");
+  const [bairro, setBairro] = useState<string>("");
 
-  const [uf, setUf] = useState<"SP" | "MG">("SP");
-  const [city, setCity] = useState<string>("");
-  const [cityList, setCityList] = useState<string[]>([]);
-  const [neighborhood, setNeighborhood] = useState<string>("");
-
-  const [keywordInput, setKeywordInput] = useState("");
+  const [keywordInput, setKeywordInput] = useState<string>("");
   const [keywords, setKeywords] = useState<string[]>(["Munck", "Guindastes", "Blocos"]);
 
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string>("");
-  const [results, setResults] = useState<PlaceRow[]>([]);
 
-  const total = results.length;
+  const [rows, setRows] = useState<CompanyRow[]>([]);
 
-  // Carrega cidades do IBGE por UF
+  const cidadesDisponiveis = useMemo(() => {
+    const list = CITIES_BY_STATE[estado] || [];
+    // ordem alfabética
+    return [...list].sort((a, b) => a.localeCompare(b, "pt-BR"));
+  }, [estado]);
+
   useEffect(() => {
-    async function loadCities() {
-      setErrorMsg("");
-      setCity("");
-      setCityList([]);
-
-      try {
-        // IBGE: /localidades/estados/{UF}/municipios (municipios = cidades)
-        const resp = await fetch(`https://servicodados.ibge.gov.br/api/v1/localidades/estados/${uf}/municipios`, {
-          cache: "force-cache",
-        });
-
-        if (!resp.ok) throw new Error("Falha ao carregar cidades do IBGE.");
-
-        const data = (await resp.json()) as Municipio[];
-        const names = data.map((x) => x.nome).sort((a, b) => a.localeCompare(b, "pt-BR"));
-
-        setCityList(names);
-        // seleciona a primeira por padrão (pra não dar “cidade obrigatória”)
-        if (names.length) setCity(names[0]);
-      } catch (e: any) {
-        setErrorMsg("Não consegui carregar a lista de cidades (IBGE).");
-      }
+    // quando troca estado, ajusta cidade para a 1ª da lista (se necessário)
+    if (!cidadesDisponiveis.includes(cidade)) {
+      setCidade(cidadesDisponiveis[0] || "");
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [estado]);
 
-    loadCities();
-  }, [uf]);
+  const totalSemDuplicados = useMemo(() => dedupeCompanies(rows).length, [rows]);
 
-  const handleKeywordKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      const k = keywordInput.trim();
-      if (!k) return;
-      const next = uniq([...keywords, k]);
-      setKeywords(next);
-      setKeywordInput("");
-    }
-  };
+  function addKeywordFromInput() {
+    const v = (keywordInput || "").trim();
+    if (!v) return;
+    setKeywords((prev) => normalizeKeywords([...prev, v]));
+    setKeywordInput("");
+  }
 
-  const removeKeyword = (k: string) => {
-    setKeywords(keywords.filter((x) => x !== k));
-  };
+  function removeKeyword(k: string) {
+    setKeywords((prev) => prev.filter((x) => x.toLowerCase() !== k.toLowerCase()));
+  }
 
-  async function handleSearch() {
+  async function buscarCompleto() {
     setErrorMsg("");
-
-    const cityTrim = city.trim();
-    if (!cityTrim) {
-      setErrorMsg("Cidade é obrigatória.");
-      return;
-    }
-
     setLoading(true);
+
     try {
-      const resp = await fetch("/api/grid-search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({
-          uf,
-          city: cityTrim,
-          neighborhood: neighborhood.trim() || null,
-          keywords: keywords,
-          totalTarget: 300,
-        }),
-      });
-
-      const data = await resp.json().catch(() => null);
-
-      if (!resp.ok) {
-        setErrorMsg(data?.error || "Erro ao buscar.");
-        setResults([]);
+      if (!cidade || !cidade.trim()) {
+        setErrorMsg("Cidade é obrigatória.");
+        setLoading(false);
         return;
       }
 
-      const items = Array.isArray(data?.results) ? data.results : [];
+      const payload = {
+        state: estado, // pode ou não ser usado no backend, mas mandamos
+        city: cidade.trim(),
+        neighborhood: (bairro || "").trim() || null,
+        keywords: normalizeKeywords(keywords),
+      };
 
-      // Normaliza para nossa tabela completa
-      const mapped: PlaceRow[] = items.map((it: any) => ({
-        place_id: it.place_id,
-        name: it.name,
-        city: cityTrim,
-        uf,
-        neighborhood: neighborhood.trim() || it.neighborhood || "",
-        address: it.address || it.formatted_address || "",
-        postal_code: it.postal_code || it.cep || "",
-        ddd: it.ddd || "",
-        phone: it.phone || it.formatted_phone_number || "",
-        website: it.website || "",
-      }));
+      const resp = await fetch("/api/grid-search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
 
-      setResults(mapped);
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(txt || "Erro na busca");
+      }
+
+      const json = await resp.json();
+
+      // Esperado: { results: [...] } ou { data: [...] } — vamos aceitar ambos
+      const incoming: CompanyRow[] = Array.isArray(json?.results)
+        ? json.results
+        : Array.isArray(json?.data)
+        ? json.data
+        : Array.isArray(json)
+        ? json
+        : [];
+
+      const deduped = dedupeCompanies(incoming);
+      setRows(deduped);
     } catch (e: any) {
-      setErrorMsg("Erro inesperado ao buscar.");
-      setResults([]);
+      console.error(e);
+      setErrorMsg(e?.message?.toString() || "Erro inesperado");
     } finally {
       setLoading(false);
     }
   }
 
+  async function exportarExcel() {
+    setErrorMsg("");
+
+    try {
+      const deduped = dedupeCompanies(rows);
+
+      if (deduped.length === 0) {
+        setErrorMsg("Não há resultados para exportar.");
+        return;
+      }
+
+      const resp = await fetch("/api/export-xlsx", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: `leads_${estado}_${cidade}`.replace(/\s+/g, "_"),
+          rows: deduped,
+        }),
+      });
+
+      if (!resp.ok) {
+        const t = await resp.text();
+        throw new Error(t || "Erro ao exportar Excel");
+      }
+
+      const blob = await resp.blob();
+      const url = window.URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `leads_${estado}_${cidade.replace(/\s+/g, "_")}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      window.URL.revokeObjectURL(url);
+    } catch (e: any) {
+      console.error(e);
+      setErrorMsg(e?.message?.toString() || "Falha ao exportar");
+    }
+  }
+
   return (
-    <div className="min-h-screen bg-[#071B25] text-white">
-      <div className="mx-auto max-w-6xl px-4 py-8">
+    <div className="min-h-screen bg-[#07131d] text-white">
+      <div className="max-w-6xl mx-auto px-4 py-8">
         {/* Header */}
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex items-start justify-between gap-4">
           <div className="flex items-center gap-4">
-            <div className="rounded-2xl bg-[#06202C] p-3 shadow-lg ring-1 ring-white/10">
-              <Image
-                src="/logo.jpg"
-                alt="RF Implementos"
-                width={120}
-                height={120}
-                className="h-16 w-16 object-contain sm:h-20 sm:w-20"
-                priority
-              />
+            <div className="rounded-2xl bg-[#0c2234] border border-white/10 p-4">
+              <Image src="/logo.jpg" alt="RF Implementos" width={120} height={120} priority />
             </div>
 
             <div>
-              <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">
-                RF <span className="text-[#FFD200]">Implementos</span>
+              <h1 className="text-4xl font-extrabold leading-tight">
+                Meus <span className="text-yellow-400">Leads</span>
               </h1>
-              <p className="text-white/70">Busca e exportação.</p>
+              <p className="text-white/70 mt-1">
+                Busque e exporte para Excel. (Busca completa)
+              </p>
             </div>
           </div>
 
-          <button
-            onClick={() => router.push("/")}
-            className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm hover:bg-white/10"
+          <Link
+            href="/"
+            className="rounded-xl border border-white/15 bg-white/5 hover:bg-white/10 px-4 py-2 text-sm"
           >
             ← Voltar
-          </button>
+          </Link>
         </div>
 
         {/* Card */}
-        <div className="mt-6 rounded-3xl bg-[#061821] p-6 shadow-2xl ring-1 ring-white/10">
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-            {/* UF */}
+        <div className="mt-8 rounded-3xl border border-white/10 bg-black/30 backdrop-blur p-6">
+          {/* Filtros */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* Estado */}
             <div>
-              <label className="mb-2 block text-sm font-medium text-white/70">Estado</label>
+              <label className="block text-sm text-white/70 mb-2">Estado</label>
               <select
-                value={uf}
-                onChange={(e) => setUf(e.target.value as "SP" | "MG")}
-                className="w-full rounded-xl border border-white/15 bg-[#04131A] px-4 py-3 text-white outline-none focus:ring-2 focus:ring-[#FFD200]"
+                value={estado}
+                onChange={(e) => setEstado(e.target.value)}
+                className="w-full rounded-xl bg-black/40 border border-white/15 px-4 py-3 outline-none focus:ring-2 focus:ring-yellow-400"
               >
-                {UF_OPTIONS.map((o) => (
-                  <option key={o.uf} value={o.uf}>
-                    {o.label}
+                {STATES.map((uf) => (
+                  <option key={uf} value={uf} className="bg-black">
+                    {uf}
                   </option>
                 ))}
               </select>
             </div>
 
-            {/* City */}
+            {/* Cidade */}
             <div>
-              <label className="mb-2 block text-sm font-medium text-white/70">Cidade</label>
+              <label className="block text-sm text-white/70 mb-2">Cidade</label>
               <select
-                value={city}
-                onChange={(e) => setCity(e.target.value)}
-                className="w-full rounded-xl border border-white/15 bg-[#04131A] px-4 py-3 text-white outline-none focus:ring-2 focus:ring-[#FFD200]"
+                value={cidade}
+                onChange={(e) => setCidade(e.target.value)}
+                className="w-full rounded-xl bg-black/40 border border-white/15 px-4 py-3 outline-none focus:ring-2 focus:ring-yellow-400"
               >
-                {cityList.length === 0 ? (
-                  <option value="">Carregando...</option>
-                ) : (
-                  cityList.map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
-                  ))
-                )}
+                {cidadesDisponiveis.map((c) => (
+                  <option key={c} value={c} className="bg-black">
+                    {c}
+                  </option>
+                ))}
               </select>
             </div>
 
-            {/* Neighborhood */}
+            {/* Bairro */}
             <div>
-              <label className="mb-2 block text-sm font-medium text-white/70">Bairro (opcional)</label>
+              <label className="block text-sm text-white/70 mb-2">Bairro (opcional)</label>
               <input
-                value={neighborhood}
-                onChange={(e) => setNeighborhood(e.target.value)}
+                value={bairro}
+                onChange={(e) => setBairro(e.target.value)}
                 placeholder="Ex: Moema"
-                className="w-full rounded-xl border border-white/15 bg-[#04131A] px-4 py-3 text-white placeholder:text-white/30 outline-none focus:ring-2 focus:ring-[#FFD200]"
+                className="w-full rounded-xl bg-black/40 border border-white/15 px-4 py-3 outline-none focus:ring-2 focus:ring-yellow-400"
               />
             </div>
           </div>
 
           {/* Keywords */}
-          <div className="mt-4">
-            <label className="mb-2 block text-sm font-medium text-white/70">Palavras-chave (Enter)</label>
+          <div className="mt-5">
+            <label className="block text-sm text-white/70 mb-2">Palavras-chave (Enter)</label>
 
-            <div className="flex flex-wrap items-center gap-2 rounded-xl border border-white/15 bg-[#04131A] px-3 py-3">
+            <div className="flex flex-wrap gap-2 mb-3">
               {keywords.map((k) => (
-                <span
-                  key={k}
-                  className="inline-flex items-center gap-2 rounded-full bg-[#FFD200] px-3 py-1 text-sm font-semibold text-black"
+                <button
+                  key={k.toLowerCase()}
+                  onClick={() => removeKeyword(k)}
+                  className="px-3 py-1 rounded-full bg-yellow-400/20 border border-yellow-400/40 text-yellow-200 text-sm hover:bg-yellow-400/25"
+                  title="Clique para remover"
                 >
-                  {k}
-                  <button
-                    onClick={() => removeKeyword(k)}
-                    className="rounded-full bg-black/15 px-2 py-0.5 text-xs hover:bg-black/25"
-                    aria-label={`Remover ${k}`}
-                  >
-                    ×
-                  </button>
-                </span>
+                  {k} <span className="text-yellow-100/70">×</span>
+                </button>
               ))}
-
-              <input
-                value={keywordInput}
-                onChange={(e) => setKeywordInput(e.target.value)}
-                onKeyDown={handleKeywordKeyDown}
-                placeholder="Ex: Munck (Enter) Guindastes (Enter) Blocos (Enter)"
-                className="min-w-[260px] flex-1 bg-transparent px-2 py-1 text-white placeholder:text-white/30 outline-none"
-              />
             </div>
+
+            <input
+              value={keywordInput}
+              onChange={(e) => setKeywordInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  addKeywordFromInput();
+                }
+              }}
+              placeholder="Ex: Munck (Enter) Guindastes (Enter) Blocos"
+              className="w-full rounded-xl bg-black/40 border border-white/15 px-4 py-3 outline-none focus:ring-2 focus:ring-yellow-400"
+            />
+
+            <p className="text-xs text-white/50 mt-2">
+              Dica: escreva uma palavra e aperte Enter. Clique na tag para remover.
+            </p>
           </div>
 
-          {/* Actions */}
-          <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex flex-col gap-3 sm:flex-row">
+          {/* Botões */}
+          <div className="mt-6 flex flex-col md:flex-row gap-3 md:items-center md:justify-between">
+            <div className="flex flex-wrap gap-3">
               <button
-                onClick={handleSearch}
+                onClick={buscarCompleto}
                 disabled={loading}
-                className="rounded-xl bg-[#FFD200] px-6 py-3 font-extrabold text-black shadow-lg hover:brightness-95 disabled:opacity-60"
+                className="rounded-xl bg-yellow-400 text-black font-bold px-6 py-3 hover:bg-yellow-300 disabled:opacity-60"
               >
-                {loading ? "Buscando..." : "Busca"}
+                {loading ? "Buscando..." : "Buscar"}
               </button>
 
               <button
-                onClick={() => alert("O export do Excel continua no botão existente do seu projeto. Se quiser, eu reativo aqui também em 1 clique.")}
-                className="rounded-xl border border-white/15 bg-white/5 px-6 py-3 font-semibold hover:bg-white/10"
+                onClick={exportarExcel}
+                disabled={loading || rows.length === 0}
+                className="rounded-xl border border-white/15 bg-white/5 hover:bg-white/10 px-6 py-3 disabled:opacity-50"
               >
-                Exportar Excel
+                Exportar Excel (.xlsx)
               </button>
             </div>
 
-            <div className="text-sm text-white/70">
-              Resultados (sem duplicados): <span className="font-bold text-white">{total}</span>
+            <div className="text-white/70">
+              Resultados (sem duplicados):{" "}
+              <span className="text-white font-semibold">{totalSemDuplicados}</span>
             </div>
           </div>
 
-          {/* Error */}
+          {/* Erro */}
           {errorMsg ? (
-            <div className="mt-4 rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-red-200">
+            <div className="mt-5 rounded-xl border border-red-500/30 bg-red-500/10 text-red-200 px-4 py-3">
               {errorMsg}
             </div>
           ) : null}
 
-          {/* Table */}
-          <div className="mt-6 overflow-hidden rounded-2xl border border-white/10">
-            <div className="overflow-x-auto">
-              <table className="min-w-[1100px] w-full text-sm">
-                <thead className="bg-black/30 text-white/80">
-                  <tr>
-                    <th className="px-4 py-3 text-left">Empresa</th>
-                    <th className="px-4 py-3 text-left">Cidade</th>
-                    <th className="px-4 py-3 text-left">Bairro</th>
-                    <th className="px-4 py-3 text-left">Endereço</th>
-                    <th className="px-4 py-3 text-left">CEP</th>
-                    <th className="px-4 py-3 text-left">DDD</th>
-                    <th className="px-4 py-3 text-left">Telefone</th>
-                    <th className="px-4 py-3 text-left">Site</th>
-                  </tr>
-                </thead>
+          {/* Tabela */}
+          <div className="mt-6 overflow-x-auto rounded-2xl border border-white/10">
+            <table className="w-full text-sm">
+              <thead className="bg-black/40">
+                <tr className="text-left">
+                  <th className="px-4 py-3">Empresa</th>
+                  <th className="px-4 py-3">Cidade</th>
+                  <th className="px-4 py-3">Bairro</th>
+                  <th className="px-4 py-3">Telefone</th>
+                  <th className="px-4 py-3">Endereço</th>
+                  <th className="px-4 py-3">Site</th>
+                </tr>
+              </thead>
 
-                <tbody className="divide-y divide-white/5 bg-[#03131A]">
-                  {results.length === 0 ? (
-                    <tr>
-                      <td className="px-4 py-6 text-white/60" colSpan={8}>
-                        Faça uma busca para listar empresas aqui.
+              <tbody>
+                {rows.length === 0 ? (
+                  <tr>
+                    <td className="px-4 py-6 text-white/60" colSpan={6}>
+                      Faça uma busca para listar empresas aqui.
+                    </td>
+                  </tr>
+                ) : (
+                  dedupeCompanies(rows).map((r, idx) => (
+                    <tr key={r.id?.toString() || `${r.name}-${idx}`} className="border-t border-white/5">
+                      <td className="px-4 py-3 font-medium">{r.name || "-"}</td>
+                      <td className="px-4 py-3">{r.city || "-"}</td>
+                      <td className="px-4 py-3">{r.neighborhood || "-"}</td>
+                      <td className="px-4 py-3">
+                        {r.ddd || r.phone ? `${r.ddd ? `(${r.ddd}) ` : ""}${r.phone || ""}` : "-"}
+                      </td>
+                      <td className="px-4 py-3">{r.address || "-"}</td>
+                      <td className="px-4 py-3">
+                        {r.website ? (
+                          <a
+                            className="text-yellow-300 hover:underline"
+                            href={r.website}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            Abrir
+                          </a>
+                        ) : (
+                          "-"
+                        )}
                       </td>
                     </tr>
-                  ) : (
-                    results.map((r, idx) => (
-                      <tr key={(r.place_id || "") + idx} className="hover:bg-white/5">
-                        <td className="px-4 py-3 font-semibold">{r.name || "-"}</td>
-                        <td className="px-4 py-3">{r.city || "-"}</td>
-                        <td className="px-4 py-3">{r.neighborhood || "-"}</td>
-                        <td className="px-4 py-3">{r.address || "-"}</td>
-                        <td className="px-4 py-3">{r.postal_code || "-"}</td>
-                        <td className="px-4 py-3">{r.ddd || "-"}</td>
-                        <td className="px-4 py-3">{r.phone || "-"}</td>
-                        <td className="px-4 py-3">
-                          {r.website ? (
-                            <a className="text-[#FFD200] hover:underline" href={r.website} target="_blank" rel="noreferrer">
-                              Abrir
-                            </a>
-                          ) : (
-                            "-"
-                          )}
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
+                  ))
+                )}
+              </tbody>
+            </table>
           </div>
 
-          <p className="mt-3 text-xs text-white/40">
-            Observação: alguns campos (CEP/DDD/Telefone/Site) só aparecem se a API retornar. Se quiser, eu habilito o “enrich”
-            para completar telefone/site automaticamente (custo maior).
+          <p className="text-xs text-white/45 mt-4">
+            Se aparecer erro, ele vai aparecer em vermelho aqui (não fica silencioso).
           </p>
         </div>
       </div>
