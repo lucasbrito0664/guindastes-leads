@@ -1,209 +1,214 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!
-);
 
 type Body = {
-  city?: string;            // obrigatório
-  neighborhood?: string;    // opcional
-  keywords?: string[];      // opcional (múltiplas)
-  maxResults?: number;      // padrão 60
+  uf?: string;                 // "SP" | "MG"
+  city?: string;               // "Guarujá"
+  neighborhood?: string | null;// opcional
+  keywords?: string[];         // ["Munck","Guindastes","Blocos"]
+  limit?: number;              // por termo (padrão 20)
+  maxResults?: number;         // total máximo (padrão 60)
 };
 
-function sleep(ms: number) {
+function normalize(s: string) {
+  return (s ?? "").toString().trim();
+}
+
+function uniq(arr: string[]) {
+  return Array.from(new Set(arr.map((x) => x.trim()).filter(Boolean)));
+}
+
+/**
+ * Variações automáticas (pode expandir depois)
+ * Regras:
+ * - Mantém o termo original
+ * - Adiciona variações comuns que aumentam cobertura (OR)
+ */
+function expandKeywords(baseKeywords: string[]) {
+  const expanded: string[] = [];
+
+  for (const k0 of baseKeywords) {
+    const k = normalize(k0);
+    if (!k) continue;
+
+    const low = k.toLowerCase();
+
+    // Sempre inclui o original
+    expanded.push(k);
+
+    // Variações por assunto
+    if (low.includes("munck") || low.includes("munk") || low.includes("guindauto")) {
+      expanded.push(
+        "caminhão munck",
+        "caminhao munck",
+        "locação munck",
+        "locacao munck",
+        "guindauto",
+        "guindaste articulado",
+        "caminhão munck aluguel",
+        "aluguel de munck"
+      );
+    }
+
+    if (low.includes("guindast")) {
+      expanded.push(
+        "locação de guindaste",
+        "locacao de guindaste",
+        "aluguel de guindaste",
+        "guindaste móvel",
+        "guindaste movel",
+        "guindaste telescópico",
+        "guindaste telescopico",
+        "guindaste para obra"
+      );
+    }
+
+    if (low.includes("bloco") || low.includes("pré") || low.includes("pre") || low.includes("concreto")) {
+      expanded.push(
+        "blocos de concreto",
+        "artefatos de concreto",
+        "pré-moldados",
+        "pre moldados",
+        "pré fabricados",
+        "pre fabricados",
+        "fábrica de blocos",
+        "fabrica de blocos"
+      );
+    }
+
+    // Se for algo genérico, adiciona variações leves sem “amarrrar”
+    // (Ex.: "locação", "aluguel" são bons ampliadores)
+    if (k.length >= 3) {
+      expanded.push(`locação ${k}`, `aluguel ${k}`);
+    }
+  }
+
+  // Limita para não explodir custo/quota
+  const finalList = uniq(expanded).slice(0, 18); // até 18 termos
+  return finalList;
+}
+
+function dedupePlaces(items: any[]) {
+  const seen = new Set<string>();
+  const out: any[] = [];
+
+  for (const it of items) {
+    const placeId = (it?.place_id || "").toString().trim();
+    const name = (it?.name || "").toString().trim().toLowerCase();
+    const address = (it?.formatted_address || it?.vicinity || "").toString().trim().toLowerCase();
+    const key = placeId ? `pid:${placeId}` : `na:${name}|${address}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+
+    out.push({
+      place_id: it.place_id,
+      name: it.name,
+      address: it.formatted_address || it.vicinity || "",
+      // campos extras que ajudam depois
+      rating: it.rating ?? null,
+      user_ratings_total: it.user_ratings_total ?? null,
+      types: it.types ?? [],
+      location: it.geometry?.location ?? null,
+    });
+  }
+  return out;
+}
+
+async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-function buildQuery(city: string, neighborhood: string, keywords: string[]) {
-  // Exemplo final: "guindaste, munck, guindastes São Paulo Vila Mariana"
-  const k = keywords.filter(Boolean).join(", ");
-  const parts = [k, city, neighborhood].filter((x) => x && x.trim().length > 0);
-  return parts.join(" ").trim();
-}
-
-function parseFromAddressComponents(components: any[]) {
-  const get = (type: string) =>
-    components?.find((c) => c.types?.includes(type))?.long_name ?? null;
-
-  const city =
-    get("locality") ||
-    get("administrative_area_level_2") ||
-    get("sublocality") ||
-    null;
-
-  const neighborhood =
-    get("sublocality") ||
-    get("sublocality_level_1") ||
-    get("neighborhood") ||
-    null;
-
-  const postal_code = get("postal_code") || null;
-
-  return { city, neighborhood, postal_code };
-}
-
-function dddFromPhone(phone?: string | null) {
-  if (!phone) return null;
-  // Brasil: geralmente "(11) 99999-9999"
-  const m = phone.match(/\((\d{2})\)/);
-  return m ? m[1] : null;
-}
-
-async function googleTextSearch(query: string, pagetoken?: string) {
-  const key = process.env.GOOGLE_MAPS_API_KEY!;
-  const url = new URL("https://maps.googleapis.com/maps/api/place/textsearch/json");
-  url.searchParams.set("query", query);
-  url.searchParams.set("language", "pt-BR");
-  url.searchParams.set("region", "br");
-  url.searchParams.set("key", key);
-  if (pagetoken) url.searchParams.set("pagetoken", pagetoken);
-
-  const res = await fetch(url.toString());
-  return res.json();
-}
-
-async function googlePlaceDetails(placeId: string) {
-  const key = process.env.GOOGLE_MAPS_API_KEY!;
-  const url = new URL("https://maps.googleapis.com/maps/api/place/details/json");
-  url.searchParams.set("place_id", placeId);
-  // Campos que precisamos para preencher suas colunas
-  url.searchParams.set(
-    "fields",
-    "place_id,name,formatted_address,formatted_phone_number,website,address_component"
-  );
-  url.searchParams.set("language", "pt-BR");
-  url.searchParams.set("key", key);
-
-  const res = await fetch(url.toString());
-  return res.json();
 }
 
 export async function POST(req: Request) {
   try {
-    const key = process.env.GOOGLE_MAPS_API_KEY;
-    if (!key) {
-      return NextResponse.json({ error: "GOOGLE_MAPS_API_KEY não configurada" }, { status: 500 });
+    const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json(
+        { error: "Faltou configurar GOOGLE_MAPS_API_KEY no .env.local / Vercel." },
+        { status: 500 }
+      );
     }
 
     const body = (await req.json()) as Body;
 
-    const city = (body.city ?? "").trim();
-    const neighborhood = (body.neighborhood ?? "").trim();
-    const keywords = Array.isArray(body.keywords)
-      ? Array.from(new Set(body.keywords.map((k) => (k ?? "").toString().trim()).filter(Boolean)))
-      : [];
-
-    const maxResults = Math.min(Math.max(body.maxResults ?? 60, 1), 60);
+    const uf = normalize(body.uf || "SP");
+    const city = normalize(body.city || "");
+    const neighborhood = normalize(body.neighborhood || "");
+    const maxResults = Math.min(Math.max(body.maxResults ?? 60, 1), 120); // 1..120
+    const limitPerTerm = Math.min(Math.max(body.limit ?? 20, 5), 60);     // 5..60
 
     if (!city) {
-      return NextResponse.json({ error: "Cidade é obrigatória" }, { status: 400 });
+      return NextResponse.json({ error: "Cidade é obrigatória." }, { status: 400 });
     }
 
-    const query = buildQuery(city, neighborhood, keywords);
+    const rawKeywords = Array.isArray(body.keywords) ? body.keywords : [];
+    const baseKeywords = uniq(rawKeywords);
 
-    // 1) Text Search paginado (até 60 = 3 páginas x 20)
+    // Se não vier keywords, usa padrões bons
+    const base = baseKeywords.length
+      ? baseKeywords
+      : ["Munck", "Guindastes", "Guindaste", "Caminhão Munck"];
+
+    // ✅ AQUI entram as variações automáticas
+    const terms = expandKeywords(base);
+
     let all: any[] = [];
-    let token: string | undefined = undefined;
 
-    for (let page = 0; page < 3 && all.length < maxResults; page++) {
-      const data = await googleTextSearch(query, token);
+    // ✅ OR real: busca termo por termo e soma (nunca restringe)
+    for (const term of terms) {
+      if (all.length >= maxResults) break;
 
-      if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
-        return NextResponse.json(
-          { error: data.error_message || data.status, raw: data },
-          { status: 400 }
-        );
+      // Query final com localização (amplia sem travar)
+      const qParts = [
+        term,
+        neighborhood ? neighborhood : "",
+        city,
+        uf,
+      ].filter(Boolean);
+
+      const query = qParts.join(" ");
+
+      // Google Places Text Search (legacy) — funciona com Places API habilitada
+      // paginação via pagetoken (máx ~60 por query, dependendo)
+      let pageToken: string | undefined = undefined;
+      let safetyPages = 0;
+
+      while (all.length < maxResults && safetyPages < 3) {
+        safetyPages++;
+
+        const url = new URL("https://maps.googleapis.com/maps/api/place/textsearch/json");
+        url.searchParams.set("query", query);
+        url.searchParams.set("key", apiKey);
+        if (pageToken) url.searchParams.set("pagetoken", pageToken);
+
+        const resp = await fetch(url.toString(), { cache: "no-store" });
+        const data = await resp.json();
+
+        const results = Array.isArray(data?.results) ? data.results : [];
+        all = all.concat(results);
+        all = dedupePlaces(all);
+
+        // Limita por termo também (para não gastar demais)
+        if (all.length >= maxResults) break;
+        if (results.length >= limitPerTerm) {
+          // ok, continua se tiver token
+        }
+
+        pageToken = data?.next_page_token;
+        if (!pageToken) break;
+
+        // pagetoken só funciona depois de 1~2s
+        await sleep(1800);
       }
-
-      const results = data.results ?? [];
-      all = all.concat(results);
-
-      token = data.next_page_token;
-      if (!token) break;
-
-      // importantíssimo: token só funciona após ~2 segundos
-      await sleep(2200);
     }
 
-    // corta no máximo pedido
+    // Corta no máximo
     all = all.slice(0, maxResults);
 
-    // 2) Deduplicar por place_id
-    const map = new Map<string, any>();
-    for (const p of all) {
-      if (p?.place_id && !map.has(p.place_id)) map.set(p.place_id, p);
-    }
-    const unique = Array.from(map.values());
-
-    // 3) Buscar details para preencher telefone/site/CEP/bairro/cidade
-    // (sim, isso faz 1 request por empresa)
-    const enriched: any[] = [];
-    for (const p of unique) {
-      const place_id = p.place_id;
-      const details = await googlePlaceDetails(place_id);
-
-      if (details.status !== "OK") {
-        // se falhar details, salva o básico
-        enriched.push({
-          place_id,
-          name: p.name ?? null,
-          address: p.formatted_address ?? null,
-          city,
-          neighborhood: neighborhood || null,
-          postal_code: null,
-          ddd: null,
-          phone: null,
-          website: null,
-          maps_url: `https://www.google.com/maps/place/?q=place_id:${place_id}`,
-        });
-        continue;
-      }
-
-      const r = details.result;
-      const comps = r.address_components || [];
-      const parsed = parseFromAddressComponents(comps);
-
-      const phone = r.formatted_phone_number ?? null;
-
-      enriched.push({
-        place_id,
-        name: r.name ?? p.name ?? null,
-        address: r.formatted_address ?? p.formatted_address ?? null,
-        city: parsed.city ?? city,
-        neighborhood: parsed.neighborhood ?? (neighborhood || null),
-        postal_code: parsed.postal_code ?? null,
-        ddd: dddFromPhone(phone),
-        phone,
-        website: r.website ?? null,
-        maps_url: `https://www.google.com/maps/place/?q=place_id:${place_id}`,
-      });
-    }
-
-    // 4) Salvar no Supabase sem duplicar (place_id UNIQUE)
-    // Upsert => se já existe, atualiza campos
-    const { error: upErr } = await supabase
-      .from("companies")
-      .upsert(enriched, { onConflict: "place_id" });
-
-    if (upErr) {
-      return NextResponse.json({ error: upErr.message }, { status: 500 });
-    }
-
     return NextResponse.json(
-      {
-        query,
-        total_google: all.length,
-        unique: unique.length,
-        saved: enriched.length,
-        results: enriched,
-      },
+      { results: all, meta: { total: all.length, terms_used: terms } },
       { status: 200 }
     );
   } catch (err: any) {
-    console.error(err);
-    return NextResponse.json({ error: "Erro interno" }, { status: 500 });
+    console.error("GOOGLE-PLACES ERROR:", err);
+    return NextResponse.json({ error: "Erro no Google Places route." }, { status: 500 });
   }
 }
