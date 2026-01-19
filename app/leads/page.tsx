@@ -37,15 +37,17 @@ function normalizeKeywords(list: string[]) {
 }
 
 function dedupeCompanies(rows: CompanyRow[]) {
-  // Preferimos place_id quando existir; senão cai no name+address
   const seen = new Set<string>();
   const out: CompanyRow[] = [];
+
   for (const r of rows) {
     const pid = (r.place_id || "").trim();
     const key =
       pid.length > 0
         ? `pid:${pid}`
-        : `${(r.name || "").trim().toLowerCase()}|${(r.address || "").trim().toLowerCase()}`;
+        : `${(r.name || "").trim().toLowerCase()}|${(r.address || "")
+            .trim()
+            .toLowerCase()}`;
 
     if (!seen.has(key)) {
       seen.add(key);
@@ -56,19 +58,21 @@ function dedupeCompanies(rows: CompanyRow[]) {
 }
 
 export default function LeadsPage() {
-  // ✅ Só SP
+  // ✅ SP only
   const estado = "SP";
 
-  // ✅ Cidades oficiais via IBGE (rota /api/cities)
+  // ✅ Cidades IBGE
   const [cidadesIBGE, setCidadesIBGE] = useState<string[]>([]);
-  const [selectedCities, setSelectedCities] = useState<string[]>([]);
+  const [cidadeDropdown, setCidadeDropdown] = useState<string>("São Paulo");
+  const [selectedCities, setSelectedCities] = useState<string[]>(["São Paulo"]);
+  const [loadingCities, setLoadingCities] = useState<boolean>(false);
 
   // ✅ Bairro com autocomplete
   const [bairroInput, setBairroInput] = useState<string>("");
-  const [bairroSelecionado, setBairroSelecionado] = useState<string>(""); // valor final usado na busca
+  const [bairroSelecionado, setBairroSelecionado] = useState<string>("");
   const [bairroSuggestions, setBairroSuggestions] = useState<string[]>([]);
 
-  // ✅ Keywords por Enter (chips)
+  // ✅ Keywords
   const [keywordInput, setKeywordInput] = useState<string>("");
   const [keywords, setKeywords] = useState<string[]>(["Munck", "Guindastes", "Blocos"]);
 
@@ -77,31 +81,57 @@ export default function LeadsPage() {
 
   const [rows, setRows] = useState<CompanyRow[]>([]);
 
-  // Carrega cidades (645) do IBGE
-  useEffect(() => {
-    (async () => {
-      try {
-        const resp = await fetch("/api/cities", { cache: "no-store" });
-        const j = await resp.json();
-
-        const list: string[] = Array.isArray(j?.cities) ? j.cities : [];
-        const sorted = [...list].sort((a, b) => a.localeCompare(b, "pt-BR"));
-
-        setCidadesIBGE(sorted);
-
-        // Default: São Paulo se existir, senão a primeira
-        if (sorted.includes("São Paulo")) setSelectedCities(["São Paulo"]);
-        else if (sorted.length > 0) setSelectedCities([sorted[0]]);
-      } catch (e) {
-        console.error(e);
-        // fallback mínimo
-        setCidadesIBGE(["São Paulo"]);
-        setSelectedCities(["São Paulo"]);
-      }
-    })();
-  }, []);
-
   const totalSemDuplicados = useMemo(() => dedupeCompanies(rows).length, [rows]);
+
+  async function carregarCidades() {
+    setLoadingCities(true);
+    try {
+      const resp = await fetch("/api/cities", { cache: "no-store" });
+      if (!resp.ok) {
+        const t = await resp.text();
+        throw new Error(t || "Falha ao carregar cidades (/api/cities)");
+      }
+      const j = await resp.json();
+
+      const list: string[] = Array.isArray(j?.cities) ? j.cities : [];
+      const sorted = [...list].sort((a, b) => a.localeCompare(b, "pt-BR"));
+
+      if (sorted.length === 0) {
+        throw new Error("A rota /api/cities respondeu, mas não trouxe cidades.");
+      }
+
+      setCidadesIBGE(sorted);
+
+      // Ajusta dropdown
+      if (sorted.includes("São Paulo")) setCidadeDropdown("São Paulo");
+      else setCidadeDropdown(sorted[0]);
+
+      // Ajusta selectedCities: mantém as já selecionadas que existirem
+      setSelectedCities((prev) => {
+        const kept = prev.filter((c) => sorted.includes(c));
+        if (kept.length > 0) return kept;
+        if (sorted.includes("São Paulo")) return ["São Paulo"];
+        return [sorted[0]];
+      });
+    } catch (e: any) {
+      console.error(e);
+      setErrorMsg(
+        (e?.message?.toString() || "Erro ao carregar cidades") +
+          " — vou manter São Paulo como fallback."
+      );
+      setCidadesIBGE(["São Paulo"]);
+      setCidadeDropdown("São Paulo");
+      setSelectedCities(["São Paulo"]);
+    } finally {
+      setLoadingCities(false);
+    }
+  }
+
+  // carrega ao abrir
+  useEffect(() => {
+    carregarCidades();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function addKeywordFromInput() {
     const v = (keywordInput || "").trim();
@@ -114,7 +144,32 @@ export default function LeadsPage() {
     setKeywords((prev) => prev.filter((x) => x.toLowerCase() !== k.toLowerCase()));
   }
 
-  // Autocomplete de bairros (usa a primeira cidade selecionada como referência)
+  function addCity() {
+    const c = (cidadeDropdown || "").trim();
+    if (!c) return;
+    setSelectedCities((prev) => {
+      const next = normalizeKeywords([...prev, c]); // reaproveita normalize (case-insensitive)
+      // normalizeKeywords mantém capitalização original do "c" e remove duplicadas
+      return next;
+    });
+
+    // bairro é “local”, então ao mexer em cidades, limpamos seleção de bairro
+    setBairroSelecionado("");
+    setBairroInput("");
+    setBairroSuggestions([]);
+  }
+
+  function removeCity(c: string) {
+    setSelectedCities((prev) => {
+      const next = prev.filter((x) => x.toLowerCase() !== c.toLowerCase());
+      return next.length ? next : ["São Paulo"];
+    });
+    setBairroSelecionado("");
+    setBairroInput("");
+    setBairroSuggestions([]);
+  }
+
+  // Autocomplete de bairros (usa a 1ª cidade selecionada como referência)
   useEffect(() => {
     const input = bairroInput.trim();
     if (input.length < 2) {
@@ -131,6 +186,12 @@ export default function LeadsPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ city: cityRef, input }),
         });
+
+        if (!resp.ok) {
+          setBairroSuggestions([]);
+          return;
+        }
+
         const j = await resp.json();
         const sugg = Array.isArray(j?.suggestions) ? j.suggestions : [];
         setBairroSuggestions(sugg.slice(0, 20));
@@ -142,7 +203,7 @@ export default function LeadsPage() {
     return () => clearTimeout(t);
   }, [bairroInput, selectedCities]);
 
-  async function buscarCompleto() {
+  async function buscar() {
     setErrorMsg("");
     setLoading(true);
 
@@ -154,7 +215,6 @@ export default function LeadsPage() {
       }
 
       const payload = {
-        // ✅ seu backend agora aceita cities[]
         cities: selectedCities.map((c) => c.trim()).filter(Boolean),
         neighborhood: (bairroSelecionado || "").trim() || null,
         keywords: normalizeKeywords(keywords),
@@ -172,7 +232,6 @@ export default function LeadsPage() {
       }
 
       const j = await resp.json();
-
       const incoming: CompanyRow[] = Array.isArray(j?.results)
         ? j.results
         : Array.isArray(j?.data)
@@ -181,8 +240,7 @@ export default function LeadsPage() {
         ? j
         : [];
 
-      const deduped = dedupeCompanies(incoming);
-      setRows(deduped);
+      setRows(dedupeCompanies(incoming));
     } catch (e: any) {
       console.error(e);
       setErrorMsg(e?.message?.toString() || "Erro inesperado");
@@ -196,7 +254,6 @@ export default function LeadsPage() {
 
     try {
       const deduped = dedupeCompanies(rows);
-
       if (deduped.length === 0) {
         setErrorMsg("Não há resultados para exportar.");
         return;
@@ -238,10 +295,10 @@ export default function LeadsPage() {
     }
   }
 
-  const cidadesOrdenadas = useMemo(
-    () => [...cidadesIBGE].sort((a, b) => a.localeCompare(b, "pt-BR")),
-    [cidadesIBGE]
-  );
+  const cidadesOrdenadas = useMemo(() => {
+    const base = cidadesIBGE.length ? cidadesIBGE : ["São Paulo"];
+    return [...base].sort((a, b) => a.localeCompare(b, "pt-BR"));
+  }, [cidadesIBGE]);
 
   return (
     <div className="min-h-screen bg-[#07131d] text-white">
@@ -250,60 +307,85 @@ export default function LeadsPage() {
         <div className="flex items-start justify-between gap-4">
           <div className="flex items-center gap-4">
             <div className="rounded-2xl bg-[#0c2234] border border-white/10 p-4">
-              <Image src="/logo.jpg" alt="RF Implementos" width={140} height={140} priority />
+              <Image src="/logo.jpg" alt="RF Implementos" width={160} height={160} priority />
             </div>
 
             <div>
               <h1 className="text-4xl font-extrabold leading-tight">
                 Meus <span className="text-yellow-400">Leads</span> (SP)
               </h1>
-              <p className="text-white/70 mt-1">Selecione cidades, opcionalmente bairro, busque e exporte.</p>
+              <p className="text-white/70 mt-1">
+                Escolha cidades, opcionalmente bairro, busque e exporte.
+              </p>
             </div>
           </div>
 
-          <Link href="/" className="rounded-xl border border-white/15 bg-white/5 hover:bg-white/10 px-4 py-2 text-sm">
+          <Link
+            href="/"
+            className="rounded-xl border border-white/15 bg-white/5 hover:bg-white/10 px-4 py-2 text-sm"
+          >
             ← Voltar
           </Link>
         </div>
 
         {/* Card */}
         <div className="mt-8 rounded-3xl border border-white/10 bg-black/30 backdrop-blur p-6">
-          {/* Filtros */}
+          {/* Linha 1: Cidade + Adicionar + Bairro */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* Cidades (multi-select) */}
+            {/* Cidades */}
             <div>
-              <label className="block text-sm text-white/70 mb-2">Cidades (selecione 1 ou mais)</label>
-              <select
-                multiple
-                value={selectedCities}
-                onChange={(e) => {
-                  const opts = Array.from(e.target.selectedOptions).map((o) => o.value);
-                  setSelectedCities(opts);
+              <label className="block text-sm text-white/70 mb-2">Cidade (adicione 1 ou mais)</label>
 
-                  // Se mudar cidade, limpamos bairro selecionado (porque bairro é “local”)
-                  setBairroSelecionado("");
-                  setBairroInput("");
-                  setBairroSuggestions([]);
-                }}
-                className="w-full h-64 rounded-xl bg-black/40 border border-white/15 px-4 py-3 outline-none focus:ring-2 focus:ring-yellow-400"
-              >
-                {cidadesOrdenadas.length === 0 ? (
-                  <option value="São Paulo">Carregando...</option>
-                ) : (
-                  cidadesOrdenadas.map((c) => (
+              <div className="flex gap-2">
+                <select
+                  value={cidadeDropdown}
+                  onChange={(e) => setCidadeDropdown(e.target.value)}
+                  className="flex-1 rounded-xl bg-black/40 border border-white/15 px-4 py-3 outline-none focus:ring-2 focus:ring-yellow-400"
+                >
+                  {cidadesOrdenadas.map((c) => (
                     <option key={c} value={c} className="bg-black">
                       {c}
                     </option>
-                  ))
-                )}
-              </select>
+                  ))}
+                </select>
+
+                <button
+                  onClick={addCity}
+                  className="rounded-xl bg-yellow-400 text-black font-bold px-4 py-3 hover:bg-yellow-300"
+                  title="Adicionar cidade"
+                >
+                  +
+                </button>
+
+                <button
+                  onClick={carregarCidades}
+                  disabled={loadingCities}
+                  className="rounded-xl border border-white/15 bg-white/5 hover:bg-white/10 px-4 py-3 disabled:opacity-60"
+                  title="Recarregar cidades do IBGE"
+                >
+                  {loadingCities ? "..." : "⟳"}
+                </button>
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                {selectedCities.map((c) => (
+                  <button
+                    key={c.toLowerCase()}
+                    onClick={() => removeCity(c)}
+                    className="px-3 py-1 rounded-full bg-yellow-400/20 border border-yellow-400/40 text-yellow-200 text-sm hover:bg-yellow-400/25"
+                    title="Clique para remover"
+                  >
+                    {c} <span className="text-yellow-100/70">×</span>
+                  </button>
+                ))}
+              </div>
 
               <p className="text-xs text-white/50 mt-2">
-                No Windows: segure <b>Ctrl</b> para selecionar várias cidades.
+                Se só aparece “São Paulo”, então a rota <b>/api/cities</b> não está retornando as 645 cidades ainda.
               </p>
             </div>
 
-            {/* Bairro (autocomplete) */}
+            {/* Bairro */}
             <div>
               <label className="block text-sm text-white/70 mb-2">Bairro (opcional)</label>
 
@@ -311,15 +393,16 @@ export default function LeadsPage() {
                 value={bairroInput}
                 onChange={(e) => {
                   setBairroInput(e.target.value);
-                  setBairroSelecionado(""); // ainda não selecionou
+                  setBairroSelecionado("");
                 }}
-                placeholder="Digite 2+ letras para aparecer lista (ex: Moe...)"
+                placeholder="Digite 2+ letras (ex: Moe...)"
                 className="w-full rounded-xl bg-black/40 border border-white/15 px-4 py-3 outline-none focus:ring-2 focus:ring-yellow-400"
               />
 
               {bairroSelecionado ? (
                 <div className="mt-2 text-sm text-white/80">
-                  Selecionado: <span className="text-yellow-300 font-semibold">{bairroSelecionado}</span>{" "}
+                  Selecionado:{" "}
+                  <span className="text-yellow-300 font-semibold">{bairroSelecionado}</span>{" "}
                   <button className="ml-2 text-xs text-white/60 underline" onClick={() => setBairroSelecionado("")}>
                     limpar
                   </button>
@@ -349,8 +432,7 @@ export default function LeadsPage() {
               </div>
 
               <p className="text-xs text-white/50 mt-2">
-                Observação: o Google sugere bairros conforme você digita (não existe “lista completa de todos os bairros”
-                via API).
+                O Google sugere bairros conforme você digita (não existe lista completa oficial via API).
               </p>
             </div>
           </div>
@@ -385,14 +467,16 @@ export default function LeadsPage() {
               className="w-full rounded-xl bg-black/40 border border-white/15 px-4 py-3 outline-none focus:ring-2 focus:ring-yellow-400"
             />
 
-            <p className="text-xs text-white/50 mt-2">Dica: escreva uma palavra e aperte Enter. Clique na tag para remover.</p>
+            <p className="text-xs text-white/50 mt-2">
+              Dica: escreva uma palavra e aperte Enter. Clique na tag para remover.
+            </p>
           </div>
 
           {/* Botões */}
           <div className="mt-6 flex flex-col md:flex-row gap-3 md:items-center md:justify-between">
             <div className="flex flex-wrap gap-3">
               <button
-                onClick={buscarCompleto}
+                onClick={buscar}
                 disabled={loading}
                 className="rounded-xl bg-yellow-400 text-black font-bold px-6 py-3 hover:bg-yellow-300 disabled:opacity-60"
               >
@@ -409,7 +493,8 @@ export default function LeadsPage() {
             </div>
 
             <div className="text-white/70">
-              Resultados (sem duplicados): <span className="text-white font-semibold">{totalSemDuplicados}</span>
+              Resultados (sem duplicados):{" "}
+              <span className="text-white font-semibold">{totalSemDuplicados}</span>
             </div>
           </div>
 
@@ -478,7 +563,7 @@ export default function LeadsPage() {
           </div>
 
           <p className="text-xs text-white/45 mt-4">
-            Se aparecer erro, ele vai aparecer em vermelho aqui. Para multi-cidade, use Ctrl no Windows.
+            Se aparecer erro, ele vai aparecer em vermelho aqui.
           </p>
         </div>
       </div>
