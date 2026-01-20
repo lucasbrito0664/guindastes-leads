@@ -2,10 +2,10 @@ import { NextResponse } from "next/server";
 
 type Body = {
   state?: string;           // "SP"
-  city?: string;            // opcional (se usar 1 cidade)
-  cities?: string[];        // opcional (se usar multi-cidade)
-  neighborhood?: string;    // opcional
+  city?: string;            // obrigatório
+  neighborhood?: string;    // opcional: se vier, usa raio 3km
   keywords?: string[];      // opcional
+  radiusKm?: number;        // opcional (padrão 3)
 };
 
 const API_KEY =
@@ -35,6 +35,20 @@ function normalizeKeywords(list: any): string[] {
   return out;
 }
 
+async function fetchJson(url: string) {
+  const r = await fetch(url, { method: "GET" });
+  const text = await r.text();
+  try {
+    return { ok: r.ok, status: r.status, json: JSON.parse(text) };
+  } catch {
+    return { ok: r.ok, status: r.status, json: null, raw: text };
+  }
+}
+
+function safeKeyUrl(u: string) {
+  return u.replace(/key=([^&]+)/, (_m, k) => `key=${String(k).slice(0, 6)}***`);
+}
+
 function extractCityFromComponents(components: any[]): string | null {
   if (!Array.isArray(components)) return null;
 
@@ -61,18 +75,58 @@ function extractNeighborhoodFromComponents(components: any[]): string | null {
   return null;
 }
 
-async function fetchJson(url: string) {
-  const r = await fetch(url, { method: "GET" });
-  const text = await r.text();
-  try {
-    return { ok: r.ok, status: r.status, json: JSON.parse(text) };
-  } catch {
-    return { ok: r.ok, status: r.status, json: null, raw: text };
-  }
+// --------- Google calls ---------
+
+async function geocodeAddress(address: string) {
+  const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
+  url.searchParams.set("key", API_KEY || "");
+  url.searchParams.set("address", address);
+
+  console.log("[grid-search] Geocode:", safeKeyUrl(url.toString()));
+
+  const res = await fetchJson(url.toString());
+  const j = res.json;
+
+  if (!j) return { status: "INVALID_RESPONSE", error_message: res.raw || "Resposta inválida" };
+
+  return j;
 }
 
-function safeKeyUrl(u: string) {
-  return u.replace(/key=([^&]+)/, (_m, k) => `key=${String(k).slice(0, 6)}***`);
+async function placesNearbySearch(params: {
+  lat: number;
+  lng: number;
+  radiusMeters: number;
+  keyword?: string;
+  pagetoken?: string;
+}) {
+  const url = new URL("https://maps.googleapis.com/maps/api/place/nearbysearch/json");
+  url.searchParams.set("key", API_KEY || "");
+  url.searchParams.set("location", `${params.lat},${params.lng}`);
+  url.searchParams.set("radius", String(params.radiusMeters));
+  if (params.keyword) url.searchParams.set("keyword", params.keyword);
+  if (params.pagetoken) url.searchParams.set("pagetoken", params.pagetoken);
+
+  console.log("[grid-search] Nearby:", safeKeyUrl(url.toString()));
+
+  const attempts = params.pagetoken ? 4 : 1;
+
+  for (let i = 0; i < attempts; i++) {
+    if (params.pagetoken && i > 0) await new Promise((r) => setTimeout(r, 1500));
+
+    const res = await fetchJson(url.toString());
+    const j = res.json;
+
+    if (!j) {
+      return { status: "INVALID_RESPONSE", error_message: res.raw || "Resposta inválida", results: [] };
+    }
+
+    // next_page_token às vezes vem "INVALID_REQUEST" até “ativar”
+    if (params.pagetoken && j.status === "INVALID_REQUEST" && i < attempts - 1) continue;
+
+    return j;
+  }
+
+  return { status: "INVALID_REQUEST", error_message: "next_page_token não ficou pronto", results: [] };
 }
 
 async function placesTextSearch(query: string, pagetoken?: string) {
@@ -118,13 +172,14 @@ async function placeDetails(placeId: string) {
   return res.json || { status: "INVALID_RESPONSE" };
 }
 
-function buildQuery(keywords: string[], neighborhood: string, city: string, state: string) {
-  const base = keywords.length
-    ? keywords.map((k) => `"${k.replace(/"/g, "")}"`).join(" OR ")
-    : `"guindaste" OR "munck"`;
+// --------- helpers ---------
 
-  const parts = [neighborhood, city, state].filter(Boolean).join(", ");
-  return `${base}, ${parts}`;
+function dedupeByPlaceId(results: any[]) {
+  const byId = new Map<string, any>();
+  for (const r of results) {
+    if (r?.place_id && !byId.has(r.place_id)) byId.set(r.place_id, r);
+  }
+  return Array.from(byId.values());
 }
 
 function dedupeByNameAddress(rows: any[]) {
@@ -139,6 +194,17 @@ function dedupeByNameAddress(rows: any[]) {
   }
   return out;
 }
+
+function buildTextQuery(keywords: string[], neighborhood: string, city: string, state: string) {
+  const base = keywords.length
+    ? keywords.map((k) => `"${k.replace(/"/g, "")}"`).join(" OR ")
+    : `"guindaste" OR "munck" OR "guindauto"`;
+
+  const parts = [neighborhood, city, state].filter(Boolean).join(", ");
+  return `${base}, ${parts}`;
+}
+
+// --------- main ---------
 
 export async function POST(req: Request) {
   try {
@@ -155,100 +221,150 @@ export async function POST(req: Request) {
     const body = (await req.json()) as Body;
 
     const state = (body.state ?? "SP").trim();
+    const city = (body.city ?? "").trim();
     const neighborhood = (body.neighborhood ?? "").trim();
     const keywords = normalizeKeywords(body.keywords);
 
-    // ✅ aceita city OU cities[]
-    const singleCity = (body.city ?? "").trim();
-    const multiCities = Array.isArray(body.cities)
-      ? body.cities.map((c) => (c ?? "").toString().trim()).filter(Boolean)
-      : [];
+    if (!city) return json({ error: "Cidade é obrigatória." }, 400);
 
-    const cities = multiCities.length > 0 ? multiCities : singleCity ? [singleCity] : [];
+    // Se informou bairro => busca por raio (3km)
+    const useRadius = neighborhood.length > 0;
+    const radiusKm = Number.isFinite(Number(body.radiusKm)) ? Number(body.radiusKm) : 3;
+    const radiusMeters = Math.max(500, Math.min(50000, Math.round(radiusKm * 1000))); // 0.5km a 50km
 
-    if (cities.length === 0) {
-      return json({ error: "Cidade é obrigatória." }, 400);
-    }
+    // 1) pegar resultados básicos (place_id + address)
+    let basicPlaces: any[] = [];
 
-    const finalResults: any[] = [];
+    if (useRadius) {
+      // 1A) Geocode do bairro
+      const geoAddress = `${neighborhood}, ${city}, ${state}, Brasil`;
+      const geo = await geocodeAddress(geoAddress);
 
-    // Busca cidade por cidade (e junta tudo)
-    for (const city of cities) {
-      const query = buildQuery(keywords, neighborhood, city, state);
+      if (geo.status !== "OK" || !geo.results?.[0]?.geometry?.location) {
+        return json(
+          {
+            error: "Não consegui localizar o bairro (geocoding).",
+            details: { status: geo.status, message: geo.error_message || null, address: geoAddress },
+          },
+          500
+        );
+      }
 
-      const allResults: any[] = [];
+      const { lat, lng } = geo.results[0].geometry.location;
+
+      // 1B) Nearby Search
+      // Importante: Nearby Search NÃO aceita OR bem. Então fazemos 1 busca por keyword e juntamos.
+      // Se não tiver keyword, usamos um fallback.
+      const kwList = keywords.length ? keywords : ["guindaste", "munck", "guindauto"];
+
+      const collected: any[] = [];
+
+      for (const kw of kwList) {
+        let nextToken: string | undefined;
+
+        for (let page = 0; page < 3; page++) {
+          const res = await placesNearbySearch({
+            lat,
+            lng,
+            radiusMeters,
+            keyword: kw,
+            pagetoken: nextToken,
+          });
+
+          console.log("[grid-search] Nearby status:", res.status, res.error_message || "");
+
+          if (res.status !== "OK" && res.status !== "ZERO_RESULTS") {
+            return json(
+              {
+                error: "Erro na API do Google Places (Nearby).",
+                details: { status: res.status, message: res.error_message || null, keyword: kw, radiusMeters },
+              },
+              500
+            );
+          }
+
+          if (Array.isArray(res.results)) collected.push(...res.results);
+
+          if (res.next_page_token) nextToken = res.next_page_token;
+          else break;
+        }
+      }
+
+      basicPlaces = dedupeByPlaceId(collected);
+    } else {
+      // 1C) Sem bairro => Text Search na cidade
+      const query = buildTextQuery(keywords, "", city, state);
+
+      const collected: any[] = [];
       let nextToken: string | undefined;
 
       for (let page = 0; page < 3; page++) {
         const res = await placesTextSearch(query, nextToken);
 
-        console.log("[grid-search] status:", res.status, res.error_message || "");
+        console.log("[grid-search] Text status:", res.status, res.error_message || "");
 
         if (res.status !== "OK" && res.status !== "ZERO_RESULTS") {
-          const hint =
-            res.status === "INVALID_REQUEST"
-              ? "Ative 'Places API' (Legacy/normal) no Google Cloud. Só 'Places API (New)' pode dar erro nesse endpoint."
-              : null;
-
           return json(
             {
-              error: "Erro na API do Google Places.",
-              details: { status: res.status, message: res.error_message || null, query, hint },
+              error: "Erro na API do Google Places (TextSearch).",
+              details: { status: res.status, message: res.error_message || null, query },
             },
             500
           );
         }
 
-        if (Array.isArray(res.results)) allResults.push(...res.results);
+        if (Array.isArray(res.results)) collected.push(...res.results);
         if (res.next_page_token) nextToken = res.next_page_token;
         else break;
       }
 
-      // dedupe por place_id
-      const byId = new Map<string, any>();
-      for (const r of allResults) {
-        if (r?.place_id && !byId.has(r.place_id)) byId.set(r.place_id, r);
-      }
-      const unique = Array.from(byId.values());
-
-      // details
-      for (const r of unique) {
-        const d = await placeDetails(r.place_id);
-
-        if (d?.status && d.status !== "OK") {
-          finalResults.push({
-            name: r.name || "",
-            city,
-            neighborhood: neighborhood || "",
-            address: r.formatted_address || "",
-            phone: "",
-            website: "",
-            maps_url: "",
-          });
-          continue;
-        }
-
-        const details = d.result || {};
-        const components = details.address_components || [];
-
-        const extractedCity = extractCityFromComponents(components);
-        const extractedNeighborhood = extractNeighborhoodFromComponents(components);
-
-        finalResults.push({
-          name: details.name || r.name || "",
-          city: extractedCity || city,
-          neighborhood: extractedNeighborhood || neighborhood || "",
-          address: details.formatted_address || r.formatted_address || "",
-          phone: details.international_phone_number || details.formatted_phone_number || "",
-          website: details.website || "",
-          maps_url: details.url || "",
-        });
-      }
+      basicPlaces = dedupeByPlaceId(collected);
     }
 
-    const deduped = dedupeByNameAddress(finalResults);
+    // 2) Details (telefone/site + extrair cidade/bairro corretos)
+    const enriched: any[] = [];
 
-    return json({ results: deduped, count: deduped.length });
+    for (const r of basicPlaces) {
+      const d = await placeDetails(r.place_id);
+
+      if (d?.status && d.status !== "OK") {
+        enriched.push({
+          name: r.name || "",
+          city,
+          neighborhood: neighborhood || "",
+          address: r.vicinity || r.formatted_address || "",
+          phone: "",
+          website: "",
+          maps_url: "",
+        });
+        continue;
+      }
+
+      const details = d.result || {};
+      const components = details.address_components || [];
+
+      const extractedCity = extractCityFromComponents(components);
+      const extractedNeighborhood = extractNeighborhoodFromComponents(components);
+
+      enriched.push({
+        name: details.name || r.name || "",
+        city: extractedCity || city,
+        neighborhood: extractedNeighborhood || neighborhood || "",
+        address: details.formatted_address || r.vicinity || r.formatted_address || "",
+        phone: details.international_phone_number || details.formatted_phone_number || "",
+        website: details.website || "",
+        maps_url: details.url || "",
+      });
+    }
+
+    const finalRows = dedupeByNameAddress(enriched);
+
+    return json({
+      mode: useRadius ? "nearby_radius" : "text_city",
+      radiusMeters: useRadius ? radiusMeters : null,
+      results: finalRows,
+      count: finalRows.length,
+    });
   } catch (err: any) {
     console.error("[grid-search] ROUTE ERROR:", err);
     return json({ error: "Erro inesperado no servidor." }, 500);
