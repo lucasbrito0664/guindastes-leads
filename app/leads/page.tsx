@@ -2,7 +2,6 @@
 
 import React, { useMemo, useState, useEffect } from "react";
 import Image from "next/image";
-import Link from "next/link";
 
 type CompanyRow = {
   name?: string;
@@ -15,8 +14,6 @@ type CompanyRow = {
   website?: string;
   maps_url?: string;
 };
-
-const STATES = ["SP"] as const; // você pediu só SP agora
 
 function normalizeKeywords(list: string[]) {
   const cleaned = list
@@ -49,32 +46,37 @@ function dedupeCompanies(rows: CompanyRow[]) {
 }
 
 export default function LeadsPage() {
-  const [estado, setEstado] = useState<string>("SP");
-  const [cidades, setCidades] = useState<string[]>([]);
-  const [cidade, setCidade] = useState<string>("");
+  const [estado] = useState<string>("SP");
+
+  const [cidades, setCidades] = useState<string[]>(["São Paulo"]);
+  const [cidade, setCidade] = useState<string>("São Paulo");
 
   const [bairro, setBairro] = useState<string>("");
 
   const [keywordInput, setKeywordInput] = useState<string>("");
   const [keywords, setKeywords] = useState<string[]>(["Munck", "Guindastes", "Blocos"]);
 
-  const [radiusKm, setRadiusKm] = useState<number>(3); // ✅ raio padrão 3km
+  const [radiusKm, setRadiusKm] = useState<number>(3);
 
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string>("");
   const [rows, setRows] = useState<CompanyRow[]>([]);
 
-  // carrega cidades do IBGE via /api/cities
   useEffect(() => {
     async function loadCities() {
       try {
         const resp = await fetch(`/api/cities?state=${estado}`);
         const j = await resp.json();
-        const list = Array.isArray(j?.cities) ? j.cities : [];
+
+        const list: string[] = Array.isArray(j?.cities) && j.cities.length > 0 ? j.cities : ["São Paulo"];
         setCidades(list);
-        setCidade((prev) => (prev && list.includes(prev) ? prev : list[0] || "São Paulo"));
-      } catch (e) {
-        // fallback
+
+        // garante que sempre tem uma cidade válida
+        setCidade((prev) => {
+          if (prev && list.includes(prev)) return prev;
+          return list[0] || "São Paulo";
+        });
+      } catch {
         setCidades(["São Paulo"]);
         setCidade("São Paulo");
       }
@@ -100,19 +102,27 @@ export default function LeadsPage() {
     setLoading(true);
 
     try {
-      if (!cidade || !cidade.trim()) {
+      const cityValue = (cidade || "").trim();
+
+      if (!cityValue) {
         setErrorMsg("Cidade é obrigatória.");
         setLoading(false);
         return;
       }
 
-      // ✅ mandando PT (backend aceita)
+      // ✅ manda duplicado (EN e PT) pra nunca falhar
       const payload = {
+        state: estado,
+        city: cityValue,
+        neighborhood: (bairro || "").trim(),
+        keywords: normalizeKeywords(keywords),
+        radiusKm,
+
+        // PT
         estado,
-        cidade: cidade.trim(),
-        bairro: (bairro || "").trim() || "",
+        cidade: cityValue,
+        bairro: (bairro || "").trim(),
         palavrasChave: normalizeKeywords(keywords),
-        radiusKm, // ✅ usa quando bairro estiver preenchido
       };
 
       const resp = await fetch("/api/grid-search", {
@@ -124,7 +134,8 @@ export default function LeadsPage() {
       const j = await resp.json();
 
       if (!resp.ok) {
-        throw new Error(j?.error || "Erro na busca");
+        // mostra mensagem do backend (inclusive debug)
+        throw new Error(j?.error ? `${j.error} ${j?.debug ? `| debug: ${JSON.stringify(j.debug)}` : ""}` : "Erro na busca");
       }
 
       const incoming: CompanyRow[] = Array.isArray(j?.results) ? j.results : [];
@@ -180,49 +191,30 @@ export default function LeadsPage() {
   return (
     <div className="min-h-screen bg-[#07131d] text-white">
       <div className="max-w-6xl mx-auto px-4 py-8">
-        <div className="flex items-start justify-between gap-4">
-          <div className="flex items-center gap-4">
-            <div className="rounded-2xl bg-[#0c2234] border border-white/10 p-4">
-              <Image src="/logo.jpg" alt="RF Implementos" width={150} height={150} priority />
-            </div>
-
-            <div>
-              <h1 className="text-4xl font-extrabold leading-tight">
-                Pesquisa de <span className="text-yellow-400">Leads</span>
-              </h1>
-              <p className="text-white/70 mt-1">
-                Se preencher Bairro, busca em raio de <span className="text-yellow-300 font-semibold">{radiusKm}km</span>.
-              </p>
-            </div>
+        <div className="flex items-center gap-4">
+          <div className="rounded-2xl bg-[#0c2234] border border-white/10 p-4">
+            <Image src="/logo.jpg" alt="RF Implementos" width={160} height={160} priority />
           </div>
 
-          <Link
-            href="/"
-            className="rounded-xl border border-white/15 bg-white/5 hover:bg-white/10 px-4 py-2 text-sm"
-          >
-            ← Voltar
-          </Link>
+          <div>
+            <h1 className="text-4xl font-extrabold">
+              Pesquisa de <span className="text-yellow-400">Leads</span>
+            </h1>
+            <p className="text-white/70 mt-1">Se preencher Bairro, busca em raio de {radiusKm}km.</p>
+          </div>
         </div>
 
         <div className="mt-8 rounded-3xl border border-white/10 bg-black/30 backdrop-blur p-6">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {/* Estado */}
             <div>
               <label className="block text-sm text-white/70 mb-2">Estado</label>
-              <select
-                value={estado}
-                onChange={(e) => setEstado(e.target.value)}
-                className="w-full rounded-xl bg-black/40 border border-white/15 px-4 py-3 outline-none focus:ring-2 focus:ring-yellow-400"
-              >
-                {STATES.map((uf) => (
-                  <option key={uf} value={uf} className="bg-black">
-                    {uf}
-                  </option>
-                ))}
-              </select>
+              <input
+                value="SP"
+                disabled
+                className="w-full rounded-xl bg-black/40 border border-white/15 px-4 py-3 opacity-80"
+              />
             </div>
 
-            {/* Cidade */}
             <div>
               <label className="block text-sm text-white/70 mb-2">Cidade</label>
               <select
@@ -238,7 +230,6 @@ export default function LeadsPage() {
               </select>
             </div>
 
-            {/* Bairro */}
             <div>
               <label className="block text-sm text-white/70 mb-2">Bairro (opcional)</label>
               <input
@@ -250,7 +241,6 @@ export default function LeadsPage() {
             </div>
           </div>
 
-          {/* Raio */}
           <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
               <label className="block text-sm text-white/70 mb-2">Raio (km) — só se tiver Bairro</label>
@@ -266,7 +256,6 @@ export default function LeadsPage() {
             </div>
           </div>
 
-          {/* Keywords */}
           <div className="mt-5">
             <label className="block text-sm text-white/70 mb-2">Palavras-chave (Enter)</label>
 
@@ -295,18 +284,13 @@ export default function LeadsPage() {
               placeholder="Digite uma palavra e aperte Enter (ex: Munck, Guindastes, Blocos)"
               className="w-full rounded-xl bg-black/40 border border-white/15 px-4 py-3 outline-none focus:ring-2 focus:ring-yellow-400"
             />
-
-            <p className="text-xs text-white/50 mt-2">
-              Dica: digite uma palavra e aperte Enter. Clique na tag para remover.
-            </p>
           </div>
 
-          {/* Botões */}
           <div className="mt-6 flex flex-col md:flex-row gap-3 md:items-center md:justify-between">
             <div className="flex flex-wrap gap-3">
               <button
                 onClick={buscar}
-                disabled={loading}
+                disabled={loading || !cidade?.trim()}
                 className="rounded-xl bg-yellow-400 text-black font-bold px-6 py-3 hover:bg-yellow-300 disabled:opacity-60"
               >
                 {loading ? "Buscando..." : "Buscar"}
@@ -322,8 +306,7 @@ export default function LeadsPage() {
             </div>
 
             <div className="text-white/70">
-              Resultados (sem duplicados):{" "}
-              <span className="text-white font-semibold">{totalSemDuplicados}</span>
+              Resultados (sem duplicados): <span className="text-white font-semibold">{totalSemDuplicados}</span>
             </div>
           </div>
 
@@ -345,7 +328,6 @@ export default function LeadsPage() {
                   <th className="px-4 py-3">Site</th>
                 </tr>
               </thead>
-
               <tbody>
                 {rows.length === 0 ? (
                   <tr>
@@ -378,7 +360,7 @@ export default function LeadsPage() {
           </div>
 
           <p className="text-xs text-white/45 mt-4">
-            Se aparecer erro, ele aparece em vermelho aqui.
+            Se der “Cidade é obrigatória”, o erro vai mostrar o debug com as chaves recebidas.
           </p>
         </div>
       </div>

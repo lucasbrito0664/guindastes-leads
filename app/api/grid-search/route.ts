@@ -1,11 +1,19 @@
 import { NextResponse } from "next/server";
 
 type Body = {
-  state?: string;           // "SP"
-  city?: string;            // obrigatório
-  neighborhood?: string;    // opcional: se vier, usa raio 3km
-  keywords?: string[];      // opcional
-  radiusKm?: number;        // opcional (padrão 3)
+  state?: string;
+  estado?: string;
+
+  city?: string;
+  cidade?: string;
+
+  neighborhood?: string;
+  bairro?: string;
+
+  keywords?: string[];
+  palavrasChave?: string[];
+
+  radiusKm?: number;
 };
 
 const API_KEY =
@@ -75,7 +83,7 @@ function extractNeighborhoodFromComponents(components: any[]): string | null {
   return null;
 }
 
-// --------- Google calls ---------
+// ---------- Google calls ----------
 
 async function geocodeAddress(address: string) {
   const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
@@ -88,7 +96,6 @@ async function geocodeAddress(address: string) {
   const j = res.json;
 
   if (!j) return { status: "INVALID_RESPONSE", error_message: res.raw || "Resposta inválida" };
-
   return j;
 }
 
@@ -120,7 +127,6 @@ async function placesNearbySearch(params: {
       return { status: "INVALID_RESPONSE", error_message: res.raw || "Resposta inválida", results: [] };
     }
 
-    // next_page_token às vezes vem "INVALID_REQUEST" até “ativar”
     if (params.pagetoken && j.status === "INVALID_REQUEST" && i < attempts - 1) continue;
 
     return j;
@@ -172,7 +178,7 @@ async function placeDetails(placeId: string) {
   return res.json || { status: "INVALID_RESPONSE" };
 }
 
-// --------- helpers ---------
+// ---------- helpers ----------
 
 function dedupeByPlaceId(results: any[]) {
   const byId = new Map<string, any>();
@@ -204,7 +210,7 @@ function buildTextQuery(keywords: string[], neighborhood: string, city: string, 
   return `${base}, ${parts}`;
 }
 
-// --------- main ---------
+// ---------- main ----------
 
 export async function POST(req: Request) {
   try {
@@ -212,7 +218,7 @@ export async function POST(req: Request) {
       return json(
         {
           error: "Falta GOOGLE_MAPS_API_KEY no servidor.",
-          dica: "No Vercel: Settings → Environment Variables → GOOGLE_MAPS_API_KEY",
+          dica: "Vercel → Project → Settings → Environment Variables → GOOGLE_MAPS_API_KEY",
         },
         500
       );
@@ -220,23 +226,40 @@ export async function POST(req: Request) {
 
     const body = (await req.json()) as Body;
 
-    const state = (body.state ?? "SP").trim();
-    const city = (body.city ?? "").trim();
-    const neighborhood = (body.neighborhood ?? "").trim();
-    const keywords = normalizeKeywords(body.keywords);
+    // ✅ DEBUG: mostra no terminal exatamente o que chegou
+    console.log("[grid-search] BODY RECEBIDO:", body);
 
-    if (!city) return json({ error: "Cidade é obrigatória." }, 400);
+    const state = ((body.state ?? body.estado ?? "SP") as string).toString().trim();
 
-    // Se informou bairro => busca por raio (3km)
+    // ✅ pega city OU cidade
+    const city = ((body.city ?? body.cidade ?? "") as string).toString().trim();
+
+    const neighborhood = ((body.neighborhood ?? body.bairro ?? "") as string).toString().trim();
+
+    const keywords = normalizeKeywords(body.keywords ?? body.palavrasChave);
+
+    if (!city) {
+      return json(
+        {
+          error: "Cidade é obrigatória.",
+          debug: {
+            recebidas: Object.keys(body || {}),
+            exemplo_certo: { city: "São Paulo", state: "SP" },
+            exemplo_pt: { cidade: "São Paulo", estado: "SP" },
+          },
+        },
+        400
+      );
+    }
+
     const useRadius = neighborhood.length > 0;
-    const radiusKm = Number.isFinite(Number(body.radiusKm)) ? Number(body.radiusKm) : 3;
-    const radiusMeters = Math.max(500, Math.min(50000, Math.round(radiusKm * 1000))); // 0.5km a 50km
 
-    // 1) pegar resultados básicos (place_id + address)
+    const radiusKm = Number.isFinite(Number(body.radiusKm)) ? Number(body.radiusKm) : 3;
+    const radiusMeters = Math.max(500, Math.min(50000, Math.round(radiusKm * 1000)));
+
     let basicPlaces: any[] = [];
 
     if (useRadius) {
-      // 1A) Geocode do bairro
       const geoAddress = `${neighborhood}, ${city}, ${state}, Brasil`;
       const geo = await geocodeAddress(geoAddress);
 
@@ -252,9 +275,6 @@ export async function POST(req: Request) {
 
       const { lat, lng } = geo.results[0].geometry.location;
 
-      // 1B) Nearby Search
-      // Importante: Nearby Search NÃO aceita OR bem. Então fazemos 1 busca por keyword e juntamos.
-      // Se não tiver keyword, usamos um fallback.
       const kwList = keywords.length ? keywords : ["guindaste", "munck", "guindauto"];
 
       const collected: any[] = [];
@@ -292,7 +312,6 @@ export async function POST(req: Request) {
 
       basicPlaces = dedupeByPlaceId(collected);
     } else {
-      // 1C) Sem bairro => Text Search na cidade
       const query = buildTextQuery(keywords, "", city, state);
 
       const collected: any[] = [];
@@ -321,7 +340,6 @@ export async function POST(req: Request) {
       basicPlaces = dedupeByPlaceId(collected);
     }
 
-    // 2) Details (telefone/site + extrair cidade/bairro corretos)
     const enriched: any[] = [];
 
     for (const r of basicPlaces) {
@@ -333,6 +351,8 @@ export async function POST(req: Request) {
           city,
           neighborhood: neighborhood || "",
           address: r.vicinity || r.formatted_address || "",
+          postal_code: "",
+          ddd: "",
           phone: "",
           website: "",
           maps_url: "",
@@ -351,6 +371,8 @@ export async function POST(req: Request) {
         city: extractedCity || city,
         neighborhood: extractedNeighborhood || neighborhood || "",
         address: details.formatted_address || r.vicinity || r.formatted_address || "",
+        postal_code: "",
+        ddd: "",
         phone: details.international_phone_number || details.formatted_phone_number || "",
         website: details.website || "",
         maps_url: details.url || "",
